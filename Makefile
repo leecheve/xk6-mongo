@@ -21,6 +21,10 @@ build:
 	go install go.k6.io/xk6/cmd/xk6@latest
 	xk6 build --with $(shell go list -m)=.
 
+buildx64:
+	go install go.k6.io/xk6/cmd/xk6@latest
+	GOARCH=amd64 GOOS=linux xk6 build --with $(shell go list -m)=.
+
 ## format: Applies Go formatting to code.
 format:
 	go fmt ./...

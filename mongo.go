@@ -3,26 +3,71 @@ package xk6_mongo
 import (
 	"context"
 	"log"
+	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 
-	k6modules "go.k6.io/k6/js/modules"
+	"go.k6.io/k6/js/modules"
+	"go.k6.io/k6/metrics"
 )
 
 // Register the extension on module initialization, available to
 // import from JS as "k6/x/mongo".
 func init() {
-	k6modules.Register("k6/x/mongo", new(Mongo))
+	modules.Register("k6/x/mongo", New())
+}
+
+type (
+	// RootModule is the global module instance that will create module
+	// instances for each VU.
+	RootModule struct{}
+
+	// ModuleInstance represents an instance of the JS module.
+	ModuleInstance struct {
+		// vu provides methods for accessing internal k6 objects for a VU
+		vu modules.VU
+		// comparator is the exported type
+		mongo *Mongo
+	}
+)
+
+// Ensure the interfaces are implemented correctly.
+var (
+	_ modules.Instance = &ModuleInstance{}
+	_ modules.Module   = &RootModule{}
+)
+
+// New returns a pointer to a new RootModule instance.
+func New() *RootModule {
+	return &RootModule{}
+}
+
+// NewModuleInstance implements the modules.Module interface returning a new instance for each VU.
+func (*RootModule) NewModuleInstance(vu modules.VU) modules.Instance {
+	return &ModuleInstance{
+		vu:    vu,
+		mongo: &Mongo{vu: vu},
+	}
+}
+
+// Exports implements the modules.Instance interface and returns the exported types for the JS module.
+func (mi *ModuleInstance) Exports() modules.Exports {
+	return modules.Exports{
+		Default: mi.mongo,
+	}
 }
 
 // Mongo is the k6 extension for a Mongo client.
-type Mongo struct{}
+type Mongo struct {
+	vu modules.VU
+}
 
 // Client is the Mongo client wrapper.
 type Client struct {
 	client *mongo.Client
+	vu     modules.VU
 }
 
 type UpsertOneModel struct {
@@ -33,7 +78,7 @@ type UpsertOneModel struct {
 // NewClient represents the Client constructor (i.e. `new mongo.Client()`) and
 // returns a new Mongo client object.
 // connURI -> mongodb://username:password@address:port/db?connect=direct
-func (*Mongo) NewClient(connURI string) *Client {
+func (m *Mongo) NewClient(connURI string) *Client {
 	log.Print("start creating new client")
 
 	clientOptions := options.Client().ApplyURI(connURI)
@@ -44,7 +89,7 @@ func (*Mongo) NewClient(connURI string) *Client {
 	}
 
 	log.Print("created new client")
-	return &Client{client: client}
+	return &Client{client: client, vu: m.vu}
 }
 
 func (c *Client) Insert(database string, collection string, doc interface{}) error {
@@ -96,6 +141,8 @@ func (c *Client) Find(database string, collection string, filter interface{}, so
 		log.Printf("Error while decoding documents: %v", err)
 		return nil, err
 	}
+
+	c.pushDataReceivedMetric(results)
 	return results, nil
 }
 
@@ -112,6 +159,8 @@ func (c *Client) Aggregate(database string, collection string, pipeline interfac
 		log.Printf("Error while decoding documents: %v", err)
 		return nil, err
 	}
+
+	c.pushDataReceivedMetric(results)
 	return results, nil
 }
 
@@ -125,6 +174,7 @@ func (c *Client) FindOne(database string, collection string, filter map[string]s
 		return nil, err
 	}
 
+	c.pushDataReceivedMetric([]bson.M{result})
 	return result, nil
 }
 
@@ -171,6 +221,7 @@ func (c *Client) FindAll(database string, collection string) ([]bson.M, error) {
 		return nil, err
 	}
 
+	c.pushDataReceivedMetric(results)
 	return results, nil
 }
 
@@ -252,5 +303,42 @@ func (c *Client) Disconnect() error {
 		return err
 	}
 
+	return nil
+}
+
+// Calculate the size of results in bytes
+func calculateResultsSizeBytes(results []bson.M) (int64, error) {
+	bytesReceived := int64(0)
+	for _, result := range results {
+		docBytes, err := bson.Marshal(result)
+		if err != nil {
+			log.Printf("Error while marshaling document: %v", err)
+			return 0, err
+		}
+		bytesReceived += int64(len(docBytes))
+	}
+	return bytesReceived, nil
+}
+
+func (c *Client) pushDataReceivedMetric(results []bson.M) error {
+	bytesReceived, err := calculateResultsSizeBytes(results)
+	if err != nil {
+		log.Printf("Error calculating response size: %v", err)
+		return err
+	}
+	state := c.vu.State()
+	dataReceivedMetric := state.BuiltinMetrics.DataReceived
+	go metrics.PushIfNotDone(c.vu.Context(), state.Samples, metrics.ConnectedSamples{
+		Samples: []metrics.Sample{
+			{
+				TimeSeries: metrics.TimeSeries{
+					Metric: dataReceivedMetric,
+					Tags:   state.Tags.GetCurrentValues().Tags,
+				},
+				Value: float64(bytesReceived),
+				Time:  time.Now().UTC(),
+			},
+		},
+	})
 	return nil
 }
