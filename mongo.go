@@ -2,6 +2,7 @@ package xk6_mongo
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -101,6 +102,7 @@ func (c *Client) Insert(database string, collection string, doc interface{}) err
 		return err
 	}
 	log.Print("Document inserted successfully")
+	c.pushDataSentMetric(doc)
 	return nil
 }
 
@@ -112,6 +114,7 @@ func (c *Client) InsertMany(database string, collection string, docs []interface
 		log.Printf("Error while inserting multiple documents: %v", err)
 		return err
 	}
+	c.pushDataSentMetric(docs)
 	return nil
 }
 
@@ -306,22 +309,56 @@ func (c *Client) Disconnect() error {
 	return nil
 }
 
-// Calculate the size of results in bytes
-func calculateResultsSizeBytes(results []bson.M) (int64, error) {
-	bytesReceived := int64(0)
-	for _, result := range results {
-		docBytes, err := bson.Marshal(result)
+func getSizeBytes(docOrDocs interface{}) (int64, error) {
+	totalBytes := int64(0)
+	switch v := docOrDocs.(type) {
+	case map[string]interface{}, bson.M: // Single document
+		bytes, err := bson.Marshal(v)
 		if err != nil {
-			log.Printf("Error while marshaling document: %v", err)
+			log.Printf("Error while marshaling single document: %v", err)
 			return 0, err
 		}
-		bytesReceived += int64(len(docBytes))
+		totalBytes = int64(len(bytes))
+	case []interface{}:
+		for _, doc := range v {
+			bytes, err := bson.Marshal(doc)
+			if err != nil {
+				log.Printf("Error while marshaling one of multiple documents: %v", err)
+				return 0, err
+			}
+			totalBytes += int64(len(bytes))
+		}
+	default:
+		return 0, fmt.Errorf("unsupported type for calculating size: %T", v)
 	}
-	return bytesReceived, nil
+	return totalBytes, nil
+}
+
+func (c *Client) pushDataSentMetric(docOrDocs interface{}) error {
+	bytesSent, err := getSizeBytes(docOrDocs)
+	if err != nil {
+		log.Printf("Error calculating request size: %v", err)
+		return err
+	}
+	state := c.vu.State()
+	dataSentMetric := state.BuiltinMetrics.DataSent
+	go metrics.PushIfNotDone(c.vu.Context(), state.Samples, metrics.ConnectedSamples{
+		Samples: []metrics.Sample{
+			{
+				TimeSeries: metrics.TimeSeries{
+					Metric: dataSentMetric,
+					Tags:   state.Tags.GetCurrentValues().Tags,
+				},
+				Value: float64(bytesSent),
+				Time:  time.Now().UTC(),
+			},
+		},
+	})
+	return nil
 }
 
 func (c *Client) pushDataReceivedMetric(results []bson.M) error {
-	bytesReceived, err := calculateResultsSizeBytes(results)
+	bytesReceived, err := getSizeBytes(results)
 	if err != nil {
 		log.Printf("Error calculating response size: %v", err)
 		return err
