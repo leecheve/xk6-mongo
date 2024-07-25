@@ -101,7 +101,7 @@ func (c *Client) Insert(database string, collection string, doc interface{}) err
 		log.Printf("Error while inserting document: %v", err)
 		return err
 	}
-	log.Print("Document inserted successfully")
+	//log.Print("Document inserted successfully")
 	c.pushDataSentMetric(doc)
 	return nil
 }
